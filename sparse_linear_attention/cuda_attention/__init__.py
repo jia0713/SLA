@@ -51,6 +51,7 @@ def cuda_attention_forward(q, k, v, lut, BLOCK_M, BLOCK_N, qk_scale):
     D = q.size(3)
     L = q.size(2)
     M_BLOCKS = (L + BLOCK_M - 1) // BLOCK_M
+    qk_scale = qk_scale * 1.4426950408889634  # pre-multiply 1/ln(2) for exp2 in CUDA kernel
     return _extension.cuda_attention_forward(q, k, v, lut.to(torch.int32), BLOCK_M, BLOCK_N, qk_scale, M_BLOCKS)
 
 
