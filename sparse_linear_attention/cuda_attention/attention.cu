@@ -40,95 +40,6 @@ __inline__ __device__ float warp_reduce_max(float val) {
     return val;
 }
 
-// Process a sub-block of keys (HALF_BLOCK_N keys) with two-pass algorithm
-// For D=64: HALF_BLOCK_N = 64 (full block), TILE_M = BLOCK_M
-// For D=128: HALF_BLOCK_N = 32 (half block to fit in smem), TILE_M <= 64
-template<int BLOCK_M, int D, int HALF_BLOCK_N, int TOPK, int TILE_M>
-__device__ void process_key_subblock(
-    const uint16_t* Q_bh, const uint16_t* K_bh, const uint16_t* V_bh,
-    const int* LUT_bh, float* OS_bh, float* LSE_bh,
-    int q_start, int tile_q_start, int tile_q_end,
-    float qk_scale, int L, int TOPK_runtime,
-    float& m_i, float& l_i, float* o_acc,
-    float* Q_smem, float* K_smem, float* qk_smem
-) {
-    // Process topk key blocks
-    for (int ki = 0; ki < TOPK_runtime; ki++) {
-        int key_block = LUT_bh[ki];
-        int key_start = key_block * BLOCK_M;  // BLOCK_M used as BLOCK_N here
-
-        // For D=128, we process keys in two sub-blocks of HALF_BLOCK_N
-        for (int sub_k = 0; sub_k < BLOCK_M; sub_k += HALF_BLOCK_N) {
-            int sub_key_start = key_start + sub_k;
-            int actual_keys = min(HALF_BLOCK_N, BLOCK_M - sub_k);
-
-            // Load K sub-block
-            for (int i = threadIdx.x; i < actual_keys * D; i += blockDim.x) {
-                int row = sub_key_start + (i / D);
-                int col = i % D;
-                int gloc = row * D + col;
-                K_smem[i] = (row < L) ? bf162float(K_bh[gloc]) : 0.0f;
-            }
-            __syncthreads();
-
-            // Each thread computes qk for its q_row against all keys in sub-block
-            int q_row = threadIdx.x;
-            if (q_row < TILE_M && tile_q_start + q_row < tile_q_end) {
-                int q_seq = tile_q_start + q_row;
-                if (q_seq < L) {
-                    // Pass 1: Compute qk values and find sub-block max
-                    float thread_qk_max = -INFINITY;
-                    for (int j = 0; j < actual_keys; j++) {
-                        int key_seq = sub_key_start + j;
-                        if (key_seq >= L) break;
-
-                        float qk = 0.0f;
-                        #pragma unroll
-                        for (int d = 0; d < D; d++) {
-                            qk += Q_smem[q_row * D + d] * K_smem[j * D + d];
-                        }
-                        qk *= qk_scale * LN2_INV;
-                        qk_smem[q_row * HALF_BLOCK_N + j] = qk;
-                        thread_qk_max = fmaxf(thread_qk_max, qk);
-                    }
-
-                    // Warp reduction to find sub-block max
-                    float sub_block_m = warp_reduce_max(thread_qk_max);
-
-                    // Update online softmax state with sub_block_m
-                    float new_m = fmaxf(m_i, sub_block_m);
-                    float alpha = (m_i == -INFINITY) ? 1.0f : exp2f(m_i - new_m);
-
-                    // Rescale accumulator before adding new contributions
-                    #pragma unroll
-                    for (int d = 0; d < D; d++) {
-                        o_acc[d] *= alpha;
-                    }
-                    l_i *= alpha;
-                    m_i = new_m;
-
-                    // Pass 2: Compute exp2(qk - block_m) and accumulate
-                    for (int j = 0; j < actual_keys; j++) {
-                        int key_seq = sub_key_start + j;
-                        if (key_seq >= L) break;
-
-                        float qk = qk_smem[q_row * HALF_BLOCK_N + j];
-                        float w = exp2f(qk - m_i);
-
-                        #pragma unroll
-                        for (int d = 0; d < D; d++) {
-                            float v_val = bf162float(V_bh[key_seq * D + d]);
-                            o_acc[d] += w * v_val;
-                        }
-                        l_i += w;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-}
-
 // D=64 kernel: each thread handles one q_row, computes full qk row, finds row max, then accum
 template<int BLOCK_M, int D, int BLOCK_N, int TOPK, int TILE_M>
 __global__ void attn_fwd_kernel_d64(
@@ -161,7 +72,7 @@ __global__ void attn_fwd_kernel_d64(
     const uint16_t* Q_bh = Q + bh_offset;
     const uint16_t* K_bh = K + bh_offset;
     const uint16_t* V_bh = V + bh_offset;
-    const int* LUT_bh = LUT + ((b * H + h) * M_BLOCKS + idx_m) * TOPK;
+    const int* LUT_bh = LUT + ((b * H + h) * M_BLOCKS + idx_m) * TOPK_runtime;
     float* OS_bh = OS + bh_offset;
     float* LSE_bh = LSE_out + (b * H + h) * L;
 
@@ -265,19 +176,18 @@ __global__ void attn_fwd_kernel_d64(
         if (tid < TILE_M) {
             int q_seq = tile_q_start + tid;
             if (q_seq < L) {
-                float norm = fmaxf(l_i, 1e-5f);
                 #pragma unroll
                 for (int d = 0; d < D; d++) {
-                    OS_bh[q_seq * D + d] = o_acc[d] / norm;
+                    OS_bh[q_seq * D + d] = o_acc[d] / l_i;
                 }
-                LSE_bh[q_seq] = m_i + log2f(norm);
+                LSE_bh[q_seq] = m_i + log2f(l_i);
             }
         }
         __syncthreads();
     }
 }
 
-// D=128 kernel: TILE_M=64, HALF_BLOCK_N=32 (processes K in 2 sub-blocks)
+// D=128 kernel: TILE_M=32, HALF_BLOCK_N=32 (processes K in 2 sub-blocks)
 template<int BLOCK_M, int D, int BLOCK_N, int TOPK, int TILE_M>
 __global__ void attn_fwd_kernel_d128(
     const uint16_t* __restrict__ Q,
@@ -309,7 +219,7 @@ __global__ void attn_fwd_kernel_d128(
     const uint16_t* Q_bh = Q + bh_offset;
     const uint16_t* K_bh = K + bh_offset;
     const uint16_t* V_bh = V + bh_offset;
-    const int* LUT_bh = LUT + ((b * H + h) * M_BLOCKS + idx_m) * TOPK;
+    const int* LUT_bh = LUT + ((b * H + h) * M_BLOCKS + idx_m) * TOPK_runtime;
     float* OS_bh = OS + bh_offset;
     float* LSE_bh = LSE_out + (b * H + h) * L;
 
@@ -383,11 +293,11 @@ __global__ void attn_fwd_kernel_d128(
                             thread_qk_max = fmaxf(thread_qk_max, qk);
                         }
 
-                        // Warp reduction for sub-block max
-                        float sub_block_m = warp_reduce_max(thread_qk_max);
+                        // Per-row max (matching Triton's tl.max(qk, 1))
+                        float thread_m = thread_qk_max;
 
                         // Update online softmax
-                        float new_m = fmaxf(m_i, sub_block_m);
+                        float new_m = fmaxf(m_i, thread_m);
                         float alpha = (m_i == -INFINITY) ? 1.0f : exp2f(m_i - new_m);
 
                         #pragma unroll
@@ -422,12 +332,11 @@ __global__ void attn_fwd_kernel_d128(
         if (tid < TILE_M) {
             int q_seq = tile_q_start + tid;
             if (q_seq < L) {
-                float norm = fmaxf(l_i, 1e-5f);
                 #pragma unroll
                 for (int d = 0; d < D; d++) {
-                    OS_bh[q_seq * D + d] = o_acc[d] / norm;
+                    OS_bh[q_seq * D + d] = o_acc[d] / l_i;
                 }
-                LSE_bh[q_seq] = m_i + log2f(norm);
+                LSE_bh[q_seq] = m_i + log2f(l_i);
             }
         }
         __syncthreads();
@@ -532,15 +441,19 @@ py::object cuda_attention_forward(
     auto LSE_out = torch::empty({B, H, L}, torch::dtype(torch::kFloat32).device(Q.device()));
 
     cudaStream_t stream = 0;
-    cudaError_t err = dispatch_attn_fwd(
-        BLOCK_M, D, BLOCK_N,
-        (uint16_t*)Q.data_ptr(), (uint16_t*)K.data_ptr(), (uint16_t*)V.data_ptr(),
-        (int*)LUT.data_ptr(),
-        (float*)OS.data_ptr(), (float*)LSE_out.data_ptr(),
-        B, H, L, qk_scale, M_BLOCKS, TOPK, stream
-    );
-
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    if (TOPK == 0) {
+        OS.zero_();
+        LSE_out.zero_();
+    } else {
+        cudaError_t err = dispatch_attn_fwd(
+            BLOCK_M, D, BLOCK_N,
+            (uint16_t*)Q.data_ptr(), (uint16_t*)K.data_ptr(), (uint16_t*)V.data_ptr(),
+            (int*)LUT.data_ptr(),
+            (float*)OS.data_ptr(), (float*)LSE_out.data_ptr(),
+            B, H, L, qk_scale, M_BLOCKS, TOPK, stream
+        );
+        TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    }
     return py::make_tuple(OS, LSE_out);
 }
 

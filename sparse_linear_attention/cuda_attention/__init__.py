@@ -34,7 +34,7 @@ if _extension is None:
                 '/usr/local/cuda/include',
             ] + torch.utils.cpp_extension.include_paths(),
             extra_cflags=['-O3'],
-            extra_cuda_cflags=['-O3', '--use_fast_math', '-std=c++17'] + arch_flags,
+            extra_cuda_cflags=['-O3', '-std=c++17'] + arch_flags,
             verbose=False,
         )
     except Exception as e:
@@ -51,7 +51,7 @@ def cuda_attention_forward(q, k, v, lut, BLOCK_M, BLOCK_N, qk_scale):
     D = q.size(3)
     L = q.size(2)
     M_BLOCKS = (L + BLOCK_M - 1) // BLOCK_M
-    return _extension.cuda_attention_forward(q, k, v, lut, BLOCK_M, BLOCK_N, qk_scale, M_BLOCKS)
+    return _extension.cuda_attention_forward(q, k, v, lut.to(torch.int32), BLOCK_M, BLOCK_N, qk_scale, M_BLOCKS)
 
 
 class CUDAAttentionFunction(torch.autograd.Function):
@@ -63,7 +63,6 @@ class CUDAAttentionFunction(torch.autograd.Function):
             qk_scale = q.size(-1) ** -0.5
 
         os = cuda_attention_forward(q, k, v, lut.to(torch.int32), BLOCK_M, BLOCK_N, qk_scale)[0].to(q.dtype)
-        os = os.to(q.dtype)
 
         ctx.save_for_backward(q, k, v, k_block_id, lut)
         ctx.qk_scale = qk_scale

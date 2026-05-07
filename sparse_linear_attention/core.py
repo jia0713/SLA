@@ -22,7 +22,7 @@ from .utils import get_block_map
 
 
 class SparseLinearAttention(nn.Module):
-    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True):
+    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True, use_cuda_sparse=False):
         R'''
         Args:
             head_dim: dimension of each head.
@@ -32,6 +32,7 @@ class SparseLinearAttention(nn.Module):
             BLKK: block size for key.
             use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
             tie_feature_map_qk: whether to use the same feature map for query and key.
+            use_cuda_sparse: if True, use CUDA kernel for sparse attention forward (forward-only, backward falls back to Triton).
         '''
         super().__init__()
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -39,6 +40,8 @@ class SparseLinearAttention(nn.Module):
         self.BLKQ = BLKQ
         self.BLKK = BLKK
         self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.float32)
+
+        self.use_cuda_sparse = use_cuda_sparse
 
         if feature_map == 'elu':
             def elu_feature_map(x):
@@ -85,7 +88,13 @@ class SparseLinearAttention(nn.Module):
         q = q.to(self.dtype)
         k = k.to(self.dtype)
         v = v.to(self.dtype)
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+
+        if self.use_cuda_sparse:
+            from sparse_linear_attention.cuda_attention import cuda_attention_forward
+            qk_scale = q.size(-1) ** -0.5
+            o_s = cuda_attention_forward(q, k, v, lut, self.BLKQ, self.BLKK, qk_scale)[0].to(q.dtype)
+        else:
+            o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
 
         q = self.feature_map_q(q).contiguous().to(self.dtype) # c_q
         k = self.feature_map_k(k).contiguous().to(self.dtype) # c_k
