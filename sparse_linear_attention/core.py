@@ -17,12 +17,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .cuda_sparse_attn import sparse_attn_forward
 from .kernel import _attention
 from .utils import get_block_map
 
 
 class SparseLinearAttention(nn.Module):
-    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True):
+    def __init__(self, head_dim, topk, feature_map='softmax', BLKQ=64, BLKK=64, use_bf16=True, tie_feature_map_qk=True, sparse_backend='triton'):
         R'''
         Args:
             head_dim: dimension of each head.
@@ -32,12 +33,16 @@ class SparseLinearAttention(nn.Module):
             BLKK: block size for key.
             use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
             tie_feature_map_qk: whether to use the same feature map for query and key.
+            sparse_backend: backend for the sparse softmax attention branch, one of ['triton', 'cuda'].
         '''
         super().__init__()
+        if sparse_backend not in ('triton', 'cuda'):
+            raise ValueError(f'Not supported sparse backend {sparse_backend}.')
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
         self.topk = topk
         self.BLKQ = BLKQ
         self.BLKK = BLKK
+        self.sparse_backend = sparse_backend
         self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.float32)
 
         if feature_map == 'elu':
@@ -85,7 +90,10 @@ class SparseLinearAttention(nn.Module):
         q = q.to(self.dtype)
         k = k.to(self.dtype)
         v = v.to(self.dtype)
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        if self.sparse_backend == 'cuda':
+            o_s = sparse_attn_forward(q, k, v, lut, real_topk, self.BLKQ, self.BLKK)
+        else:
+            o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
 
         q = self.feature_map_q(q).contiguous().to(self.dtype) # c_q
         k = self.feature_map_k(k).contiguous().to(self.dtype) # c_k

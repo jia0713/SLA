@@ -13,7 +13,44 @@ Citation (please cite if you use this code):
 }
 """
 
-from setuptools import setup, find_packages
+import os
+
+from setuptools import find_packages, setup
+
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+except Exception:
+    BuildExtension = None
+    CUDAExtension = None
+    CUDA_HOME = None
+
+
+def should_build_cuda_extension():
+    value = os.environ.get("SLA_BUILD_CUDA")
+    if value is not None:
+        return value not in ("0", "false", "False", "OFF", "off")
+    return CUDAExtension is not None and CUDA_HOME is not None
+
+
+ext_modules = []
+cmdclass = {}
+if should_build_cuda_extension():
+    if CUDAExtension is None or CUDA_HOME is None:
+        raise RuntimeError("SLA_BUILD_CUDA is enabled, but CUDA/NVCC was not found.")
+    ext_modules.append(
+        CUDAExtension(
+            name="sparse_attn_cuda",
+            sources=[
+                "sparse_linear_attention/csrc/sparse_attn.cpp",
+                "sparse_linear_attention/csrc/sparse_attn_fwd.cu",
+            ],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math"],
+            },
+        )
+    )
+    cmdclass["build_ext"] = BuildExtension
 
 setup(
     name='sparse_linear_attention',
@@ -30,5 +67,7 @@ setup(
     ],
     extras_require={
         'benchmark': ['flash-attn']
-    }
+    },
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )
