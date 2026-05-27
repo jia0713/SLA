@@ -3,7 +3,9 @@
 *.egg-info
 .vscode
 *.pyc
+*.so
 __pycache__
 .DS_Store
 build/
 dist/
+sla_remote_smoke.py
