@@ -91,6 +91,18 @@ Build the extension:
 python setup.py build_ext --inplace
 ```
 
+Build and install a wheel in the `sla` conda environment:
+
+```bash
+rm -rf build dist *.egg-info
+python setup.py bdist_wheel
+python -m pip install --force-reinstall --no-deps dist/sparse_linear_attention-*.whl
+```
+
+After installing the wheel, run tests from the repository root or any other
+working directory in the same conda environment. Rebuild and reinstall the wheel
+after changing C++/MACA sources.
+
 Run correctness tests:
 
 ```bash
