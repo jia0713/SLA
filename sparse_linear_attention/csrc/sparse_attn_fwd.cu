@@ -12,20 +12,21 @@ constexpr int kMaxHeadDim = 128;
 #if defined(USE_MACA)
 using v4f16 = __NATIVE_VECTOR__(4, _Float16);
 using v4f32 = __NATIVE_VECTOR__(4, float);
+#define MACA_WAVE_SYNC() __syncwave()
 
+template <int HEAD_DIM, bool FULL_TILES>
 __device__ __forceinline__ v4f32 mma_qk_tile(
     const _Float16* __restrict__ q,
     const _Float16* __restrict__ k,
     int64_t qkv_base,
     int64_t L,
-    int64_t D,
     int64_t m_start,
     int64_t n_start,
     int tid) {
   v4f32 acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
 #pragma unroll
-  for (int k_tile = 0; k_tile < D / 16; ++k_tile) {
+  for (int k_tile = 0; k_tile < HEAD_DIM / 16; ++k_tile) {
     v4f16 q_frag;
     v4f16 k_frag;
 
@@ -37,8 +38,13 @@ __device__ __forceinline__ v4f32 mma_qk_tile(
       const int k_dim = k_tile * 16 + (tid / 16) * 4 + i;
       const int64_t m = m_start + q_row;
       const int64_t n = n_start + k_col;
-      q_frag[i] = (m < L) ? q[qkv_base + m * D + q_dim] : static_cast<_Float16>(0.0f);
-      k_frag[i] = (n < L) ? k[qkv_base + n * D + k_dim] : static_cast<_Float16>(0.0f);
+      if constexpr (FULL_TILES) {
+        q_frag[i] = q[qkv_base + m * HEAD_DIM + q_dim];
+        k_frag[i] = k[qkv_base + n * HEAD_DIM + k_dim];
+      } else {
+        q_frag[i] = (m < L) ? q[qkv_base + m * HEAD_DIM + q_dim] : static_cast<_Float16>(0.0f);
+        k_frag[i] = (n < L) ? k[qkv_base + n * HEAD_DIM + k_dim] : static_cast<_Float16>(0.0f);
+      }
     }
 
     acc = __builtin_mxc_mma_16x16x16f16(q_frag, k_frag, acc);
@@ -47,6 +53,7 @@ __device__ __forceinline__ v4f32 mma_qk_tile(
   return acc;
 }
 
+template <bool FULL_TILES>
 __device__ __forceinline__ void store_qk_scores(
     v4f32 frag,
     float scores[16][64],
@@ -62,10 +69,15 @@ __device__ __forceinline__ void store_qk_scores(
     const int col = tid % 16;
     const int64_t m = m_start + row;
     const int64_t n = n_start + col;
-    scores[row][n_tile * 16 + col] = (m < L && n < L) ? frag[i] * scale : -INFINITY;
+    if constexpr (FULL_TILES) {
+      scores[row][n_tile * 16 + col] = frag[i] * scale;
+    } else {
+      scores[row][n_tile * 16 + col] = (m < L && n < L) ? frag[i] * scale : -INFINITY;
+    }
   }
 }
 
+template <int HEAD_DIM, int TOPK, bool FULL_TILES>
 __global__ void sparse_attn_fwd_maca_mma_kernel_bm64(
     const _Float16* __restrict__ q,
     const _Float16* __restrict__ k,
@@ -73,86 +85,111 @@ __global__ void sparse_attn_fwd_maca_mma_kernel_bm64(
     const int64_t* __restrict__ lut,
     _Float16* __restrict__ out,
     int64_t L,
-    int64_t D,
     int64_t M_BLOCKS,
     int64_t topk,
     float scale) {
+  const int topk_limit = TOPK > 0 ? TOPK : static_cast<int>(topk);
   const int64_t m_block = blockIdx.x / 4;
   const int q_tile = blockIdx.x % 4;
   const int64_t bh = blockIdx.y;
   const int tid = threadIdx.x;
-  const int64_t qkv_base = bh * L * D;
+  constexpr int kDTiles = HEAD_DIM / 16;
+  const int64_t qkv_base = bh * L * HEAD_DIM;
   const int64_t lut_base = (bh * M_BLOCKS + m_block) * topk;
   const int64_t m_start = m_block * 64 + q_tile * 16;
 
   __shared__ float scores[16][64];
+  __shared__ float partial_max[16][16];
+  __shared__ float partial_sum[16][16];
   __shared__ float row_max[16];
   __shared__ float row_sum[16];
+  __shared__ float row_alpha[16];
+
+  v4f32 out_acc[kDTiles];
+#pragma unroll
+  for (int d_tile = 0; d_tile < kDTiles; ++d_tile) {
+    out_acc[d_tile] = {0.0f, 0.0f, 0.0f, 0.0f};
+  }
 
   if (tid < 16) {
     row_max[tid] = -INFINITY;
     row_sum[tid] = 0.0f;
+    row_alpha[tid] = 0.0f;
   }
-  __syncthreads();
+  MACA_WAVE_SYNC();
 
-  for (int64_t block_idx = 0; block_idx < topk; ++block_idx) {
+  #pragma unroll
+  for (int block_idx = 0; block_idx < topk_limit; ++block_idx) {
     const int64_t n_block = lut[lut_base + block_idx];
 
 #pragma unroll
     for (int n_tile = 0; n_tile < 4; ++n_tile) {
       const int64_t n_start = n_block * 64 + n_tile * 16;
-      const v4f32 qk = mma_qk_tile(q, k, qkv_base, L, D, m_start, n_start, tid);
-      store_qk_scores(qk, scores, n_tile, tid, scale, m_start, n_start, L);
+      const v4f32 qk = mma_qk_tile<HEAD_DIM, FULL_TILES>(q, k, qkv_base, L, m_start, n_start, tid);
+      store_qk_scores<FULL_TILES>(qk, scores, n_tile, tid, scale * 1.4426950408889634f, m_start, n_start, L);
     }
-    __syncthreads();
+    MACA_WAVE_SYNC();
 
-    if (tid < 16) {
-      float local_max = row_max[tid];
+    const int score_group = tid / 16;
+    const int score_col = tid % 16;
 #pragma unroll
-      for (int n = 0; n < 64; ++n) {
-        local_max = fmaxf(local_max, scores[tid][n]);
-      }
-      row_max[tid] = local_max;
-    }
-    __syncthreads();
-  }
-
-  for (int64_t block_idx = 0; block_idx < topk; ++block_idx) {
-    const int64_t n_block = lut[lut_base + block_idx];
-
-#pragma unroll
-    for (int n_tile = 0; n_tile < 4; ++n_tile) {
-      const int64_t n_start = n_block * 64 + n_tile * 16;
-      const v4f32 qk = mma_qk_tile(q, k, qkv_base, L, D, m_start, n_start, tid);
-      store_qk_scores(qk, scores, n_tile, tid, scale, m_start, n_start, L);
-    }
-    __syncthreads();
-
-    if (tid < 16) {
-      float local_sum = row_sum[tid];
-#pragma unroll
-      for (int n = 0; n < 64; ++n) {
-        local_sum += expf(scores[tid][n] - row_max[tid]);
-      }
-      row_sum[tid] = local_sum;
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int d_tile = 0; d_tile < D / 16; ++d_tile) {
-    v4f32 out_acc = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    for (int64_t block_idx = 0; block_idx < topk; ++block_idx) {
-      const int64_t n_block = lut[lut_base + block_idx];
-
+    for (int i = 0; i < 4; ++i) {
+      const int row = score_group * 4 + i;
+      float local_max = -INFINITY;
 #pragma unroll
       for (int n_tile = 0; n_tile < 4; ++n_tile) {
-        const int64_t n_start = n_block * 64 + n_tile * 16;
-        const v4f32 qk = mma_qk_tile(q, k, qkv_base, L, D, m_start, n_start, tid);
-        store_qk_scores(qk, scores, n_tile, tid, scale, m_start, n_start, L);
+        local_max = fmaxf(local_max, scores[row][n_tile * 16 + score_col]);
       }
-      __syncthreads();
+      partial_max[row][score_col] = local_max;
+    }
+    MACA_WAVE_SYNC();
+
+    if (tid < 16) {
+      const bool valid_m = (m_start + tid) < L;
+      float local_max = -INFINITY;
+#pragma unroll
+      for (int col = 0; col < 16; ++col) {
+        local_max = fmaxf(local_max, partial_max[tid][col]);
+      }
+      const float old_max = row_max[tid];
+      const float new_max = fmaxf(old_max, local_max);
+      const float alpha = valid_m ? exp2f(old_max - new_max) : 0.0f;
+      row_alpha[tid] = alpha;
+      row_max[tid] = new_max;
+    }
+    MACA_WAVE_SYNC();
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = score_group * 4 + i;
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int n_tile = 0; n_tile < 4; ++n_tile) {
+        const float p = exp2f(scores[row][n_tile * 16 + score_col] - row_max[row]);
+        scores[row][n_tile * 16 + score_col] = p;
+        local_sum += p;
+      }
+      partial_sum[row][score_col] = local_sum;
+    }
+    MACA_WAVE_SYNC();
+
+    if (tid < 16) {
+      const bool valid_m = (m_start + tid) < L;
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int col = 0; col < 16; ++col) {
+        local_sum += partial_sum[tid][col];
+      }
+      row_sum[tid] = valid_m ? row_sum[tid] * row_alpha[tid] + local_sum : 1.0f;
+    }
+    MACA_WAVE_SYNC();
+
+    for (int d_tile = 0; d_tile < kDTiles; ++d_tile) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = (tid / 16) * 4 + i;
+        out_acc[d_tile][i] *= row_alpha[row];
+      }
 
 #pragma unroll
       for (int n_tile = 0; n_tile < 4; ++n_tile) {
@@ -167,24 +204,31 @@ __global__ void sparse_attn_fwd_maca_mma_kernel_bm64(
           const int v_col = tid % 16;
           const int64_t n = n_block * 64 + n_tile * 16 + v_row;
           const int d = d_tile * 16 + v_col;
-          const float p = expf(scores[p_row][n_tile * 16 + p_col] - row_max[p_row]) / row_sum[p_row];
-          p_frag[i] = static_cast<_Float16>(p);
-          v_frag[i] = (n < L) ? v[qkv_base + n * D + d] : static_cast<_Float16>(0.0f);
+          p_frag[i] = static_cast<_Float16>(scores[p_row][n_tile * 16 + p_col]);
+          if constexpr (FULL_TILES) {
+            v_frag[i] = v[qkv_base + n * HEAD_DIM + d];
+          } else {
+            v_frag[i] = (n < L) ? v[qkv_base + n * HEAD_DIM + d] : static_cast<_Float16>(0.0f);
+          }
         }
 
-        out_acc = __builtin_mxc_mma_16x16x16f16(p_frag, v_frag, out_acc);
+        out_acc[d_tile] = __builtin_mxc_mma_16x16x16f16(p_frag, v_frag, out_acc[d_tile]);
       }
-      __syncthreads();
     }
+    MACA_WAVE_SYNC();
+  }
 
+  for (int d_tile = 0; d_tile < kDTiles; ++d_tile) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int row = (tid / 16) * 4 + i;
       const int col = tid % 16;
       const int64_t m = m_start + row;
       const int d = d_tile * 16 + col;
-      if (m < L) {
-        out[qkv_base + m * D + d] = static_cast<_Float16>(out_acc[i]);
+      if constexpr (FULL_TILES) {
+        out[qkv_base + m * HEAD_DIM + d] = static_cast<_Float16>(out_acc[d_tile][i] / row_sum[row]);
+      } else if (m < L) {
+        out[qkv_base + m * HEAD_DIM + d] = static_cast<_Float16>(out_acc[d_tile][i] / row_sum[row]);
       }
     }
   }
@@ -297,18 +341,52 @@ void launch_sparse_attn_fwd(
     if (D == 64 || D == 128) {
       dim3 grid(M_BLOCKS * 4, B * H);
       dim3 block(64);
-      sparse_attn_fwd_maca_mma_kernel_bm64<<<
-          grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<const _Float16*>(q.data_ptr<scalar_t>()),
-          reinterpret_cast<const _Float16*>(k.data_ptr<scalar_t>()),
-          reinterpret_cast<const _Float16*>(v.data_ptr<scalar_t>()),
-          lut.data_ptr<int64_t>(),
-          reinterpret_cast<_Float16*>(out.data_ptr<scalar_t>()),
-          L,
-          D,
-          M_BLOCKS,
-          topk,
-          scale);
+      const bool full_tiles = (L % 64) == 0;
+#define SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, TOPK_VALUE, FULL_TILES_VALUE) \
+  sparse_attn_fwd_maca_mma_kernel_bm64<HEAD_DIM_VALUE, TOPK_VALUE, FULL_TILES_VALUE><<< \
+      grid, block, 0, at::cuda::getCurrentCUDAStream()>>>( \
+      reinterpret_cast<const _Float16*>(q.data_ptr<scalar_t>()), \
+      reinterpret_cast<const _Float16*>(k.data_ptr<scalar_t>()), \
+      reinterpret_cast<const _Float16*>(v.data_ptr<scalar_t>()), \
+      lut.data_ptr<int64_t>(), \
+      reinterpret_cast<_Float16*>(out.data_ptr<scalar_t>()), \
+      L, \
+      M_BLOCKS, \
+      topk, \
+      scale)
+#define SLA_DISPATCH_MACA_MMA(HEAD_DIM_VALUE, FULL_TILES_VALUE) \
+  do { \
+    if (topk == 1) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 1, FULL_TILES_VALUE); \
+    } else if (topk == 2) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 2, FULL_TILES_VALUE); \
+    } else if (topk == 4) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 4, FULL_TILES_VALUE); \
+    } else if (topk == 8) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 8, FULL_TILES_VALUE); \
+    } else if (topk == 16) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 16, FULL_TILES_VALUE); \
+    } else if (topk == 32) { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, 32, FULL_TILES_VALUE); \
+    } else { \
+      SLA_LAUNCH_MACA_MMA(HEAD_DIM_VALUE, -1, FULL_TILES_VALUE); \
+    } \
+  } while (0)
+      if (D == 64) {
+        if (full_tiles) {
+          SLA_DISPATCH_MACA_MMA(64, true);
+        } else {
+          SLA_DISPATCH_MACA_MMA(64, false);
+        }
+      } else {
+        if (full_tiles) {
+          SLA_DISPATCH_MACA_MMA(128, true);
+        } else {
+          SLA_DISPATCH_MACA_MMA(128, false);
+        }
+      }
+#undef SLA_DISPATCH_MACA_MMA
+#undef SLA_LAUNCH_MACA_MMA
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
