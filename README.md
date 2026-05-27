@@ -107,7 +107,18 @@ python -m pytest \
   -q
 ```
 
-Run the Triton-vs-MACA performance benchmark:
+Run the fixed Triton-vs-MACA correctness and performance matrix with pytest:
+
+```bash
+python -m pytest tests/test_maca_sparse_attn_benchmark.py -q -s
+```
+
+This pytest benchmark covers several fixed parameter combinations, validates
+the MACA output against Triton, and prints median Triton/MACA latency for each
+case. Use this when comparing optimization commits, so the tested shapes stay
+consistent across runs.
+
+Run an ad hoc Triton-vs-MACA performance benchmark:
 
 ```bash
 python -m evaluate.bench_maca_sparse_attn \
