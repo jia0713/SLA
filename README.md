@@ -50,6 +50,95 @@ v = torch.randn((B, H, L, D), dtype=torch.bfloat16, device='cuda')
 o = attn(q, k, v)
 ```
 
+### MACA Sparse Attention Development
+
+The `maca` branch includes a MACA MMA sparse attention forward path and a
+benchmark that compares it with the Triton implementation. The local machine is
+used for editing; build and test commands below should be run on a MACA GPU
+machine.
+
+Sync the local checkout to the MACA host:
+
+```bash
+rsync -az \
+  --exclude __pycache__ \
+  --exclude .pytest_cache \
+  --exclude build \
+  --exclude dist \
+  --exclude '*.egg-info' \
+  /home/jianing/workspace/SLA/ \
+  acl_ici@10.0.180.24:/home/acl_ici/workspace/SLA/
+```
+
+Prepare the remote environment:
+
+```bash
+ssh acl_ici@10.0.180.24
+source /home/acl_ici/miniforge3/etc/profile.d/conda.sh
+conda activate sla
+
+cd /home/acl_ici/workspace/SLA
+
+export MACA_PATH=/opt/maca
+export PATH=/opt/maca/mxgpu_llvm/bin:$PATH
+export LD_LIBRARY_PATH=/home/acl_ici/miniforge3/envs/sla/lib/python3.12/site-packages/torch/lib:/opt/maca/lib:$LD_LIBRARY_PATH
+export MAX_JOBS=4
+```
+
+Build the extension:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+Run correctness tests:
+
+```bash
+python -m pytest tests/test_cuda_sparse_attn.py -q
+```
+
+Run the full MACA MMA and sparse attention test set:
+
+```bash
+python -m pytest \
+  tests/test_maca_mma_layout_probe.py \
+  tests/test_maca_attention_tile_probe.py \
+  tests/test_cuda_sparse_attn.py \
+  -q
+```
+
+Run the Triton-vs-MACA performance benchmark:
+
+```bash
+python -m evaluate.bench_maca_sparse_attn \
+  --batch 1 \
+  --heads 2 \
+  --seqlens 512 1024 2048 \
+  --head-dim 64 \
+  --block-m 64 \
+  --topk-ratio 0.5 \
+  --warmup 5 \
+  --iters 10
+```
+
+For a larger multi-head case:
+
+```bash
+python -m evaluate.bench_maca_sparse_attn \
+  --batch 2 \
+  --heads 16 \
+  --seqlens 512 1024 2048 \
+  --head-dim 64 \
+  --block-m 64 \
+  --topk-ratio 0.25 \
+  --warmup 5 \
+  --iters 10
+```
+
+In the benchmark output, `triton_ms` is the Triton baseline, `maca_ms` is the
+MACA kernel time, and `speedup > 1.0x` means the MACA kernel is faster than
+Triton.
+
 ### SageSLA
 
 We provide **SageSLA**, a very fast SLA (Sparse-Linear Attention) forward pass based on [SageAttention](https://github.com/thu-ml/SageAttention). It uses some code from [SpargeAttn](https://github.com/thu-ml/SpargeAttn). Please refer to the `SageSLA/` directory for the usage of SageSLA.
