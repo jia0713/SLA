@@ -45,7 +45,7 @@ def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
     actual = sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
     _sync()
     max_abs = (actual - expected).abs().max().item()
-    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
     triton_fn = lambda: _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
     maca_fn = lambda: sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)

@@ -60,4 +60,5 @@ def test_cuda_sparse_attn_forward_matches_triton(dtype, head_dim, block_m):
         expected = _sparse_attn_reference(q, k, v, lut, topk, block_m, block_n)
     actual = sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
 
-    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+    atol = 4e-3 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=1e-3)
