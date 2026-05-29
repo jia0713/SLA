@@ -166,11 +166,11 @@ __device__ __forceinline__ void store_qk_scores(
   for (int i = 0; i < 4; ++i) {
     const int row = (tid / 16) * 4 + i;
     const int col = tid % 16;
-    const int64_t m = m_start + row;
-    const int64_t n = n_start + col;
     if constexpr (FULL_TILES) {
       scores[row][n_tile * 16 + col] = frag[i] * scale;
     } else {
+      const int64_t m = m_start + row;
+      const int64_t n = n_start + col;
       scores[row][n_tile * 16 + col] = (m < L && n < L) ? frag[i] * scale : -INFINITY;
     }
   }
@@ -191,12 +191,12 @@ __device__ __forceinline__ void store_qk_scores_update_max(
   for (int i = 0; i < 4; ++i) {
     const int row = (tid / 16) * 4 + i;
     const int col = tid % 16;
-    const int64_t m = m_start + row;
-    const int64_t n = n_start + col;
     float score;
     if constexpr (FULL_TILES) {
       score = frag[i] * scale;
     } else {
+      const int64_t m = m_start + row;
+      const int64_t n = n_start + col;
       score = (m < L && n < L) ? frag[i] * scale : -INFINITY;
     }
     scores[row][n_tile * 16 + col] = score;
@@ -290,10 +290,13 @@ __device__ __forceinline__ void compute_topk_block_w4_smem(
   for (int i = 0; i < 4; ++i) {
     const int row = score_group * 4 + i;
     const float block_max = row_reduce_max(block_local_max[i]);
-    const bool valid_m = (m_start + row) < L;
     const float old_max = row_max[i];
     const float new_max = fmaxf(old_max, block_max);
-    row_alpha[i] = valid_m ? exp2f(old_max - new_max) : 0.0f;
+    if constexpr (FULL_TILES) {
+      row_alpha[i] = exp2f(old_max - new_max);
+    } else {
+      row_alpha[i] = ((m_start + row) < L) ? exp2f(old_max - new_max) : 0.0f;
+    }
     row_max[i] = new_max;
   }
 
@@ -308,7 +311,11 @@ __device__ __forceinline__ void compute_topk_block_w4_smem(
       local_sum += p;
     }
     local_sum = row_reduce_sum(local_sum);
-    row_sum[i] = ((m_start + row) < L) ? row_sum[i] * row_alpha[i] + local_sum : 1.0f;
+    if constexpr (FULL_TILES) {
+      row_sum[i] = row_sum[i] * row_alpha[i] + local_sum;
+    } else {
+      row_sum[i] = ((m_start + row) < L) ? row_sum[i] * row_alpha[i] + local_sum : 1.0f;
+    }
   }
   MACA_WAVE_SYNC();
 
