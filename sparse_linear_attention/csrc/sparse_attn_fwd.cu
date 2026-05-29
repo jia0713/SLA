@@ -10,6 +10,7 @@ namespace {
 constexpr int kMaxHeadDim = 128;
 
 #if defined(USE_MACA)
+constexpr float kLog2E = 1.4426950408889634f;
 using v4f16 = __NATIVE_VECTOR__(4, _Float16);
 using v4f32 = __NATIVE_VECTOR__(4, float);
 #define MACA_WAVE_SYNC() __syncwave()
@@ -166,6 +167,8 @@ __device__ __forceinline__ void store_qk_scores(
   for (int i = 0; i < 4; ++i) {
     const int row = (tid / 16) * 4 + i;
     const int col = tid % 16;
+    // FULL_TILES means both query and key 64-token blocks are in bounds. Keep
+    // the common path free of tail predicates for the full-sequence benchmarks.
     if constexpr (FULL_TILES) {
       scores[row][n_tile * 16 + col] = frag[i] * scale;
     } else {
@@ -192,6 +195,8 @@ __device__ __forceinline__ void store_qk_scores_update_max(
     const int row = (tid / 16) * 4 + i;
     const int col = tid % 16;
     float score;
+    // Same full-tile fast path as store_qk_scores(), but also accumulate the
+    // per-thread local maximum used by the online softmax update below.
     if constexpr (FULL_TILES) {
       score = frag[i] * scale;
     } else {
@@ -220,6 +225,8 @@ __device__ __forceinline__ void load_kv_block_smem(
   v4f16* v_smem_vec = reinterpret_cast<v4f16*>(v_smem);
   const v4f16* k_vec = reinterpret_cast<const v4f16*>(k + qkv_base + n_block_start * HEAD_DIM);
   const v4f16* v_vec = reinterpret_cast<const v4f16*>(v + qkv_base + n_block_start * HEAD_DIM);
+  // The CTA cooperatively stages one 64-token K/V block. Vectorized v4f16
+  // copies match the fragment width used by the MACA MMA builtin.
 #pragma unroll
   for (int vec_idx = cta_tid; vec_idx < (64 * HEAD_DIM) / 4; vec_idx += 256) {
     const int elem_idx = vec_idx * 4;
@@ -280,10 +287,12 @@ __device__ __forceinline__ void compute_topk_block_w4_smem(
     const v4f32 qk = mma_qk_tile_smem_k<HEAD_DIM, FULL_TILES>(
         q, k_smem + n_tile * 16 * HEAD_DIM, qkv_base, L, m_start, tid);
     store_qk_scores_update_max<FULL_TILES>(
-        qk, scores, block_local_max, n_tile, tid, scale * 1.4426950408889634f, m_start, n_start, L);
+        qk, scores, block_local_max, n_tile, tid, scale * kLog2E, m_start, n_start, L);
   }
   MACA_WAVE_SYNC();
 
+  // Online softmax over sparse key blocks. row_max/row_sum/out_acc persist
+  // across TOPK blocks; row_alpha rescales the old state when the max changes.
   const int score_group = tid / 16;
   const int score_col = tid % 16;
 #pragma unroll
@@ -330,6 +339,8 @@ __device__ __forceinline__ void compute_topk_block_w4_smem(
       v4f16 p_frag;
       v4f16 v_frag;
 
+      // P is read from the score tile using the native A layout, while V uses
+      // the native B layout. The MMA output therefore accumulates P @ V.
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int p_row = tid % 16;
@@ -367,6 +378,8 @@ __global__ void sparse_attn_fwd_maca_mma_kernel_bm64_w4_smem(
   const int64_t lut_base = (bh * M_BLOCKS + m_block) * topk;
   const int64_t m_start = m_block * 64 + q_tile * 16;
 
+  // One CTA owns a 64-row query block. Its four 64-thread waves each compute a
+  // 16-row slice and share the staged K/V block.
   __shared__ float scores_storage[4][16][64];
   __shared__ _Float16 k_smem[64 * HEAD_DIM];
   __shared__ _Float16 v_smem[64 * HEAD_DIM];
@@ -389,6 +402,8 @@ __global__ void sparse_attn_fwd_maca_mma_kernel_bm64_w4_smem(
   }
 
   if constexpr (TOPK > 0) {
+    // Common TOPK values are template-specialized by the launcher, letting the
+    // compiler unroll sparse block traversal.
 #pragma unroll
     for (int block_idx = 0; block_idx < TOPK; ++block_idx) {
       const int64_t n_block = lut[lut_base + block_idx];
