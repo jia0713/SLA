@@ -35,13 +35,48 @@ def _make_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
     return q, k, v, sparse_map, lut, topk
 
 
+def _sparse_attn_reference(q, k, v, lut, topk, block_m, block_n):
+    B, H, L, D = q.shape
+    m_blocks = (L + block_m - 1) // block_m
+    scale = D ** -0.5
+    out = torch.empty_like(q)
+    lut_view = lut.reshape(B * H, m_blocks, topk)
+
+    for b in range(B):
+        for h in range(H):
+            bh = b * H + h
+            for m_block in range(m_blocks):
+                m_start = m_block * block_m
+                m_end = min(m_start + block_m, L)
+                block_ids = lut_view[bh, m_block, :topk].to(torch.long)
+                key_chunks = []
+                for n_block in block_ids.tolist():
+                    n_start = n_block * block_n
+                    n_end = min(n_start + block_n, L)
+                    if n_start < n_end:
+                        key_chunks.append(torch.arange(n_start, n_end, device=q.device))
+                key_idx = torch.cat(key_chunks)
+
+                q_block = q[b, h, m_start:m_end].float()
+                k_block = k[b, h, key_idx].float()
+                v_block = v[b, h, key_idx].float()
+                scores = q_block @ k_block.T * scale
+                probs = torch.softmax(scores, dim=-1)
+                out[b, h, m_start:m_end] = (probs @ v_block).to(q.dtype)
+
+    return out
+
+
 @torch.no_grad()
 def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_ratio, warmup, iters):
     q, k, v, sparse_map, lut, topk = _make_case(
         batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_ratio
     )
 
-    expected = _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
+    if head_dim == 64:
+        expected = _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
+    else:
+        expected = _sparse_attn_reference(q, k, v, lut, topk, block_m, block_n)
     actual = sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
     _sync()
     max_abs = (actual - expected).abs().max().item()
@@ -50,7 +85,12 @@ def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
     triton_fn = lambda: _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
     cute_fn = lambda: sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
 
-    triton_mean, triton_median, triton_min = _time_ms(triton_fn, warmup, iters)
+    triton_error = None
+    try:
+        triton_mean, triton_median, triton_min = _time_ms(triton_fn, warmup, iters)
+    except Exception as exc:
+        triton_error = type(exc).__name__
+        triton_mean = triton_median = triton_min = None
     cute_mean, cute_median, cute_min = _time_ms(cute_fn, warmup, iters)
 
     return {
@@ -64,15 +104,16 @@ def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
         "topk": int(topk),
         "topk_ratio": topk_ratio,
         "max_abs": max_abs,
+        "triton_error": triton_error,
         "triton_mean_ms": triton_mean,
         "triton_median_ms": triton_median,
         "triton_min_ms": triton_min,
         "cute_mean_ms": cute_mean,
         "cute_median_ms": cute_median,
         "cute_min_ms": cute_min,
-        "cute_speedup_mean": triton_mean / cute_mean,
-        "cute_speedup_median": triton_median / cute_median,
-        "cute_speedup_min": triton_min / cute_min,
+        "cute_speedup_mean": None if triton_mean is None else triton_mean / cute_mean,
+        "cute_speedup_median": None if triton_median is None else triton_median / cute_median,
+        "cute_speedup_min": None if triton_min is None else triton_min / cute_min,
     }
 
 
@@ -105,9 +146,17 @@ def _print_table(rows):
                     str(row["BLOCK_N"]),
                     str(row["topk"]),
                     f"{row['max_abs']:.4g}",
-                    f"{row['triton_median_ms']:.3f}",
+                    (
+                        row["triton_error"]
+                        if row["triton_median_ms"] is None
+                        else f"{row['triton_median_ms']:.3f}"
+                    ),
                     f"{row['cute_median_ms']:.3f}",
-                    f"{row['cute_speedup_median']:.3f}x",
+                    (
+                        "n/a"
+                        if row["cute_speedup_median"] is None
+                        else f"{row['cute_speedup_median']:.3f}x"
+                    ),
                 ]
             )
         )

@@ -34,7 +34,7 @@ torch::Tensor sparse_attn_forward(
   TORCH_CHECK(lut.scalar_type() == torch::kInt64, "lut must be int64");
   TORCH_CHECK(topk > 0, "topk must be positive");
   TORCH_CHECK(block_m == 64 && block_n == 64, "CUTE forward requires block_m=64 and block_n=64");
-  TORCH_CHECK(q.size(3) == 64, "CUTE forward requires head_dim=64");
+  TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128, "CUTE forward requires head_dim=64 or 128");
   TORCH_CHECK(q.size(2) % 64 == 0, "CUTE forward requires seqlen to be a multiple of 64");
   return sparse_attn_forward_cuda(q, k, v, lut, topk, block_m, block_n);
 }

@@ -17,7 +17,7 @@ def _load_extension():
 def sparse_attn_forward(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
     """Run the CUTE kernel.
 
-    The current kernel is intentionally narrow: fp16, head_dim=64, block
+    The current kernel is intentionally narrow: fp16, head_dim in {64, 128}, block
     shape 64x64, and full 64-token tiles. Unsupported cases should use the
     Triton backend.
     """
@@ -32,8 +32,8 @@ def sparse_attn_forward(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
         raise RuntimeError("The CUDA sparse attention backend currently supports fp16 inputs only.")
     if q.shape != k.shape or q.shape != v.shape:
         raise RuntimeError("q, k, and v must have the same shape.")
-    if q.shape[-1] != 64:
-        raise RuntimeError("The CUDA sparse attention backend requires head_dim=64.")
+    if q.shape[-1] not in (64, 128):
+        raise RuntimeError("The CUDA sparse attention backend requires head_dim=64 or 128.")
     if q.shape[-2] % 64 != 0:
         raise RuntimeError("The CUDA sparse attention backend requires sequence length to be a multiple of 64.")
     if BLOCK_M != 64 or BLOCK_N != 64:
