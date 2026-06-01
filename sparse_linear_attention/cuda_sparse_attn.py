@@ -15,6 +15,14 @@ def _load_extension():
 
 
 def sparse_attn_forward(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
+    return _sparse_attn_forward_impl("forward", q, k, v, lut, topk, BLOCK_M, BLOCK_N)
+
+
+def sparse_attn_forward_cute(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
+    return _sparse_attn_forward_impl("forward_cute", q, k, v, lut, topk, BLOCK_M, BLOCK_N)
+
+
+def _sparse_attn_forward_impl(entrypoint, q, k, v, lut, topk, BLOCK_M, BLOCK_N):
     if q.requires_grad or k.requires_grad or v.requires_grad:
         raise RuntimeError(
             "The CUDA sparse attention backend is forward-only. "
@@ -34,7 +42,7 @@ def sparse_attn_forward(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
         raise RuntimeError("topk must be positive.")
 
     ext = _load_extension()
-    return ext.forward(
+    return getattr(ext, entrypoint)(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),

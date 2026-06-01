@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sparse_linear_attention.cuda_sparse_attn import sparse_attn_forward
+from sparse_linear_attention.cuda_sparse_attn import sparse_attn_forward, sparse_attn_forward_cute
 from sparse_linear_attention.kernel import _attention
 from sparse_linear_attention.utils import get_block_map
 
@@ -59,6 +59,8 @@ def test_cuda_sparse_attn_forward_matches_triton(dtype, head_dim, block_m):
     else:
         expected = _sparse_attn_reference(q, k, v, lut, topk, block_m, block_n)
     actual = sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
+    actual_cute = sparse_attn_forward_cute(q, k, v, lut, topk, block_m, block_n)
 
     atol = 4e-3 if dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(actual, expected, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(actual_cute, expected, atol=atol, rtol=1e-3)

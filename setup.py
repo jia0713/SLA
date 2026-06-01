@@ -37,16 +37,43 @@ cmdclass = {}
 if should_build_cuda_extension():
     if CUDAExtension is None or CUDA_HOME is None:
         raise RuntimeError("SLA_BUILD_CUDA is enabled, but CUDA/NVCC was not found.")
+    flashattn_csrc = os.path.abspath(os.path.join("flashattn_cute_example", "flashattn", "csrc"))
+    maca_cute_include_dirs = []
+    if os.path.isdir(flashattn_csrc):
+        maca_cute_include_dirs = [
+            os.path.join(flashattn_csrc, "flash_attn", "flash_kernel"),
+            os.path.join(flashattn_csrc, "flash_attn", "flash_kernel", "feature"),
+            os.path.join(flashattn_csrc, "flash_attn", "flash_kernel", "kernel_traits"),
+            os.path.join(flashattn_csrc, "flash_attn", "utils"),
+            os.path.join(flashattn_csrc, "mctlass", "include"),
+        ]
+        nvcc_args_define_maca_cute = ["-DSLA_ENABLE_MACA_CUTE"]
+    else:
+        nvcc_args_define_maca_cute = []
+    nvcc_args = [
+        "-O3",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-D__FAST_HALF_CVT__",
+        "-D__MERGE_LDS_B64",
+    ] + nvcc_args_define_maca_cute
     ext_modules.append(
         CUDAExtension(
             name="sparse_attn_cuda",
             sources=[
                 "sparse_linear_attention/csrc/sparse_attn.cpp",
                 "sparse_linear_attention/csrc/sparse_attn_fwd.cu",
+                "sparse_linear_attention/csrc/sparse_attn_cute_fwd.cu",
             ],
+            include_dirs=maca_cute_include_dirs,
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "--use_fast_math"],
+                "nvcc": nvcc_args,
             },
         )
     )
