@@ -1,4 +1,4 @@
-"""Forward-only CUDA backend for the sparse softmax attention branch."""
+"""Forward-only MACA CUTE backend for the sparse softmax attention branch."""
 
 import torch
 
@@ -15,14 +15,12 @@ def _load_extension():
 
 
 def sparse_attn_forward(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
-    return _sparse_attn_forward_impl("forward", q, k, v, lut, topk, BLOCK_M, BLOCK_N)
+    """Run the CUTE kernel.
 
-
-def sparse_attn_forward_cute(q, k, v, lut, topk, BLOCK_M, BLOCK_N):
-    return _sparse_attn_forward_impl("forward_cute", q, k, v, lut, topk, BLOCK_M, BLOCK_N)
-
-
-def _sparse_attn_forward_impl(entrypoint, q, k, v, lut, topk, BLOCK_M, BLOCK_N):
+    The current kernel is intentionally narrow: fp16, head_dim=64, block
+    shape 64x64, and full 64-token tiles. Unsupported cases should use the
+    Triton backend.
+    """
     if q.requires_grad or k.requires_grad or v.requires_grad:
         raise RuntimeError(
             "The CUDA sparse attention backend is forward-only. "
@@ -30,19 +28,21 @@ def _sparse_attn_forward_impl(entrypoint, q, k, v, lut, topk, BLOCK_M, BLOCK_N):
         )
     if not q.is_cuda:
         raise RuntimeError("The CUDA sparse attention backend requires CUDA tensors.")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError("The CUDA sparse attention backend supports fp16 and bf16 inputs.")
+    if q.dtype != torch.float16:
+        raise RuntimeError("The CUDA sparse attention backend currently supports fp16 inputs only.")
     if q.shape != k.shape or q.shape != v.shape:
         raise RuntimeError("q, k, and v must have the same shape.")
-    if q.shape[-1] not in (64, 128):
-        raise RuntimeError("The CUDA sparse attention backend supports head_dim 64 or 128.")
-    if BLOCK_M not in (64, 128) or BLOCK_N != 64:
-        raise RuntimeError("The CUDA sparse attention backend supports BLOCK_M in {64, 128} and BLOCK_N=64.")
+    if q.shape[-1] != 64:
+        raise RuntimeError("The CUDA sparse attention backend requires head_dim=64.")
+    if q.shape[-2] % 64 != 0:
+        raise RuntimeError("The CUDA sparse attention backend requires sequence length to be a multiple of 64.")
+    if BLOCK_M != 64 or BLOCK_N != 64:
+        raise RuntimeError("The CUDA sparse attention backend requires BLOCK_M=64 and BLOCK_N=64.")
     if int(topk) <= 0:
         raise RuntimeError("topk must be positive.")
 
     ext = _load_extension()
-    return getattr(ext, entrypoint)(
+    return ext.forward(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),

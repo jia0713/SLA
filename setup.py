@@ -67,7 +67,6 @@ if should_build_cuda_extension():
             name="sparse_attn_cuda",
             sources=[
                 "sparse_linear_attention/csrc/sparse_attn.cpp",
-                "sparse_linear_attention/csrc/sparse_attn_fwd.cu",
                 "sparse_linear_attention/csrc/sparse_attn_cute_fwd.cu",
             ],
             include_dirs=maca_cute_include_dirs,

@@ -4,7 +4,7 @@ import time
 
 import torch
 
-from sparse_linear_attention.cuda_sparse_attn import sparse_attn_forward, sparse_attn_forward_cute
+from sparse_linear_attention.cuda_sparse_attn import sparse_attn_forward
 from sparse_linear_attention.kernel import _attention
 from sparse_linear_attention.utils import get_block_map
 
@@ -43,19 +43,14 @@ def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
 
     expected = _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
     actual = sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
-    actual_cute = sparse_attn_forward_cute(q, k, v, lut, topk, block_m, block_n)
     _sync()
     max_abs = (actual - expected).abs().max().item()
-    max_abs_cute = (actual_cute - expected).abs().max().item()
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(actual_cute, expected, atol=1e-3, rtol=1e-3)
 
     triton_fn = lambda: _attention.apply(q, k, v, sparse_map, lut, topk, block_m, block_n)
-    maca_fn = lambda: sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
-    cute_fn = lambda: sparse_attn_forward_cute(q, k, v, lut, topk, block_m, block_n)
+    cute_fn = lambda: sparse_attn_forward(q, k, v, lut, topk, block_m, block_n)
 
     triton_mean, triton_median, triton_min = _time_ms(triton_fn, warmup, iters)
-    maca_mean, maca_median, maca_min = _time_ms(maca_fn, warmup, iters)
     cute_mean, cute_median, cute_min = _time_ms(cute_fn, warmup, iters)
 
     return {
@@ -69,19 +64,12 @@ def bench_case(batch, heads, seqlen, head_dim, dtype, block_m, block_n, topk_rat
         "topk": int(topk),
         "topk_ratio": topk_ratio,
         "max_abs": max_abs,
-        "max_abs_cute": max_abs_cute,
         "triton_mean_ms": triton_mean,
         "triton_median_ms": triton_median,
         "triton_min_ms": triton_min,
-        "maca_mean_ms": maca_mean,
-        "maca_median_ms": maca_median,
-        "maca_min_ms": maca_min,
         "cute_mean_ms": cute_mean,
         "cute_median_ms": cute_median,
         "cute_min_ms": cute_min,
-        "speedup_mean": triton_mean / maca_mean,
-        "speedup_median": triton_median / maca_median,
-        "speedup_min": triton_min / maca_min,
         "cute_speedup_mean": triton_mean / cute_mean,
         "cute_speedup_median": triton_median / cute_median,
         "cute_speedup_min": triton_min / cute_min,
@@ -99,11 +87,8 @@ def _print_table(rows):
         "BN",
         "topk",
         "max_abs",
-        "cute_abs",
         "triton_ms",
-        "maca_ms",
         "cute_ms",
-        "speedup",
         "cute_spd",
     ]
     print("\t".join(headers))
@@ -120,11 +105,8 @@ def _print_table(rows):
                     str(row["BLOCK_N"]),
                     str(row["topk"]),
                     f"{row['max_abs']:.4g}",
-                    f"{row['max_abs_cute']:.4g}",
                     f"{row['triton_median_ms']:.3f}",
-                    f"{row['maca_median_ms']:.3f}",
                     f"{row['cute_median_ms']:.3f}",
-                    f"{row['speedup_median']:.3f}x",
                     f"{row['cute_speedup_median']:.3f}x",
                 ]
             )

@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .cuda_sparse_attn import sparse_attn_forward, sparse_attn_forward_cute
+from .cuda_sparse_attn import sparse_attn_forward
 from .kernel import _attention
 from .utils import get_block_map
 
@@ -33,11 +33,13 @@ class SparseLinearAttention(nn.Module):
             BLKK: block size for key.
             use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
             tie_feature_map_qk: whether to use the same feature map for query and key.
-            sparse_backend: backend for the sparse softmax attention branch, one of ['triton', 'cuda', 'cuda_cute'].
+            sparse_backend: backend for the sparse softmax attention branch, one of ['triton', 'cuda'].
         '''
         super().__init__()
-        if sparse_backend not in ('triton', 'cuda', 'cuda_cute'):
+        if sparse_backend not in ('triton', 'cuda'):
             raise ValueError(f'Not supported sparse backend {sparse_backend}.')
+        if sparse_backend == 'cuda' and use_bf16:
+            raise ValueError("The CUDA CUTE sparse backend currently requires use_bf16=False.")
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
         self.topk = topk
         self.BLKQ = BLKQ
@@ -92,8 +94,6 @@ class SparseLinearAttention(nn.Module):
         v = v.to(self.dtype)
         if self.sparse_backend == 'cuda':
             o_s = sparse_attn_forward(q, k, v, lut, real_topk, self.BLKQ, self.BLKK)
-        elif self.sparse_backend == 'cuda_cute':
-            o_s = sparse_attn_forward_cute(q, k, v, lut, real_topk, self.BLKQ, self.BLKK)
         else:
             o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
 

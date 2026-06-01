@@ -48,10 +48,7 @@ def test_maca_sparse_attn_matches_triton_and_reports_perf(
         "MACA sparse attention benchmark: "
         f"B={row['B']} H={row['H']} L={row['L']} D={row['D']} "
         f"topk={row['topk']} max_abs={row['max_abs']:.4g} "
-        f"cute_abs={row['max_abs_cute']:.4g} "
         f"triton={row['triton_median_ms']:.3f}ms "
-        f"maca={row['maca_median_ms']:.3f}ms "
         f"cute={row['cute_median_ms']:.3f}ms "
-        f"speedup={row['speedup_median']:.3f}x "
         f"cute_speedup={row['cute_speedup_median']:.3f}x"
     )

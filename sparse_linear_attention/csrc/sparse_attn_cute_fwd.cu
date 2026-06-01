@@ -7,6 +7,11 @@
 
 #if defined(USE_MACA) && defined(SLA_ENABLE_MACA_CUTE)
 #define SLA_HAS_MACA_CUTE 1
+#else
+#define SLA_HAS_MACA_CUTE 0
+#endif
+
+#if SLA_HAS_MACA_CUTE
 
 #include <cute/algorithm/copy.hpp>
 #include <cute/tensor.hpp>
@@ -23,6 +28,8 @@ namespace {
 using namespace cute;
 
 constexpr float kLog2E = 1.4426950408889634f;
+using SparseD64Traits =
+    Flash_fwd_kernel_traits<64, 64, 64, 4, false, false, mctlass::half_t, 64>;
 
 template <int TOPK>
 __global__ void sparse_attn_fwd_maca_cute_d64_bm64_kernel(
@@ -36,8 +43,7 @@ __global__ void sparse_attn_fwd_maca_cute_d64_bm64_kernel(
     int64_t topk,
     float scale,
     float scale_log2) {
-  using Kernel_traits =
-      Flash_fwd_kernel_traits<64, 64, 64, 4, false, false, mctlass::half_t, 64>;
+  using Kernel_traits = SparseD64Traits;
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
 
@@ -294,8 +300,7 @@ void launch_sparse_attn_fwd_maca_cute_d64(
 
   dim3 grid(M_BLOCKS, B * H);
   dim3 block(256);
-  constexpr int kSmemBytes =
-      Flash_fwd_kernel_traits<64, 64, 64, 4, false, false, mctlass::half_t, 64>::kSmemSize;
+  constexpr int kSmemBytes = SparseD64Traits::kSmemSize;
 
 #define SLA_LAUNCH_CUTE(TOPK_VALUE)                                            \
   sparse_attn_fwd_maca_cute_d64_bm64_kernel<TOPK_VALUE>                        \
@@ -341,26 +346,16 @@ torch::Tensor sparse_attn_forward_cuda(
     torch::Tensor lut,
     int64_t topk,
     int64_t block_m,
-    int64_t block_n);
-
-torch::Tensor sparse_attn_forward_cute_cuda(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor lut,
-    int64_t topk,
-    int64_t block_m,
     int64_t block_n) {
   const c10::cuda::CUDAGuard device_guard(q.device());
+  (void)block_m;
+  (void)block_n;
 
 #if SLA_HAS_MACA_CUTE
-  if (q.scalar_type() == torch::kFloat16 && q.size(3) == 64 && block_m == 64 &&
-      block_n == 64 && q.size(2) % 64 == 0 && topk >= 4) {
-    auto out = torch::empty_like(q);
-    launch_sparse_attn_fwd_maca_cute_d64(q, k, v, lut, out, topk);
-    return out;
-  }
+  auto out = torch::empty_like(q);
+  launch_sparse_attn_fwd_maca_cute_d64(q, k, v, lut, out, topk);
+  return out;
+#else
+  TORCH_CHECK(false, "MACA CUTE sparse attention was not enabled at build time");
 #endif
-
-  return sparse_attn_forward_cuda(q, k, v, lut, topk, block_m, block_n);
 }
